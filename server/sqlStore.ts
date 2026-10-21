@@ -86,6 +86,10 @@ export class SqlStore implements Store {
     if (!commentCols.some((c) => c.name === "anchor")) {
       this.sql.exec("ALTER TABLE comments ADD COLUMN anchor TEXT");
     }
+    const postCols = this.sql.exec("SELECT name FROM pragma_table_info('posts')").toArray();
+    if (!postCols.some((c) => c.name === "jobId")) {
+      this.sql.exec("ALTER TABLE posts ADD COLUMN jobId TEXT");
+    }
     this.migrateToSurfaces();
     this.migrateToPosts();
     this.migrateSurfaceIds();
@@ -251,6 +255,7 @@ export class SqlStore implements Store {
       updatedAt: r.updatedAt as string,
       version: r.version as number,
       history: JSON.parse(r.history as string) as PostVersion[],
+      jobId: (r.jobId as string | undefined) ?? undefined,
     };
   }
 
@@ -437,9 +442,10 @@ export class SqlStore implements Store {
       updatedAt: now,
       version: 1,
       history: [],
+      jobId: input.jobId,
     };
     this.sql.exec(
-      "INSERT INTO posts (id, sessionId, title, surfaces, createdAt, updatedAt, version, history) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO posts (id, sessionId, title, surfaces, createdAt, updatedAt, version, history, jobId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       post.id,
       post.sessionId,
       post.title,
@@ -448,6 +454,7 @@ export class SqlStore implements Store {
       post.updatedAt,
       post.version,
       "[]",
+      post.jobId ?? null,
     );
     this.touch(input.sessionId);
     this.addAssetRefs(input.surfaces);

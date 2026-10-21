@@ -446,6 +446,7 @@ export function createApp({
     sessionTitle?: string;
     agent?: string;
     cwd?: string;
+    jobId?: string;
   }): Promise<
     { post: Post; userFeedback?: Feedback[] } | { error: string; status: 400 | 404 | 413 }
   > {
@@ -474,6 +475,7 @@ export function createApp({
       sessionId,
       surfaces: input.surfaces,
       title: input.title?.slice(0, MAX_TITLE),
+      jobId: input.jobId,
     });
     if (!post) return { error: "session not found", status: 404 };
     bus.broadcast({ type: "post-created", id: post.id, sessionId, version: 1 });
@@ -1252,6 +1254,304 @@ export function createApp({
       },
       201,
     );
+  });
+
+  // --- push-to-talk: viewer hold-to-talk button → pi-voicekit-style capture
+  // --- of the default microphone → mp3 published as an audio card. The voice
+  // module is Node-only (child processes), so it is imported lazily — the
+  // Cloudflare Worker build never touches these routes.
+
+  app.post("/api/voice/start", async (c) => {
+    const voice = await import("./voice.ts");
+    const rec = await voice.startVoiceRecording();
+    if ("error" in rec) return c.json(rec, rec.status);
+    return c.json(rec, 201);
+  });
+
+  // Job + inbox state for the post-stop pipeline (transcribe → note → Pi).
+  // One process = one workspace, so in-memory maps are authoritative.
+  const voiceJobs = new Map<
+    string,
+    {
+      id: string;
+      state: "running" | "done" | "error";
+      step: string;
+      transcript?: string;
+      error?: string;
+      sentToPi: boolean;
+      postId?: string;
+      file: string;
+      url: string;
+    }
+  >();
+  const voiceInbox: {
+    id: string;
+    seq: number;
+    jobId: string;
+    transcript: string;
+    mp3Url: string;
+    session?: string;
+    createdAt: string;
+    status: "pending" | "delivered";
+    deliveredBy?: string;
+    deliveredAt?: string;
+  }[] = [];
+  let voiceInboxSeq = 0;
+  // If Pi claims a transcript but never posts its reply, settle the job rather
+  // than leaving the voice card's progress spinner running forever.
+  const PI_RESULT_TIMEOUT_MS = 5 * 60_000;
+
+  const audioHtml = (url: string) =>
+    `<audio class="voice-note" controls preload="metadata"
+        style="display:block;width:100%;margin:2px 0;" src="${url}"></audio>`;
+
+  async function runVoiceJob(
+    jobId: string,
+    result: { url: string; file: string; pcm: Buffer },
+    session: string | undefined,
+    req: Request,
+  ): Promise<void> {
+    const job = voiceJobs.get(jobId);
+    if (!job) return;
+    const step = (s: string) => {
+      job.step = s;
+    };
+    try {
+      const origin = new URL(req.url).origin;
+      const url = `${origin}${requestBasePath(req)}${result.url}`;
+      const stamp = new Date().toLocaleString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+        day: "numeric",
+        month: "short",
+      });
+      const title = `🎙 Voice note — ${stamp}`;
+
+      // 1 — publish the audio card right away, so the take is on the board
+      // while the (slow) transcription runs.
+      step("Publishing audio card…");
+      let published = await publishPostFlow({
+        surfaces: [htmlSurface(audioHtml(url))],
+        title,
+        session,
+        sessionTitle: "Voice notes",
+        agent: "viewer",
+        jobId,
+      });
+      // The selected session may have been deleted between start and stop —
+      // fall back to a fresh Voice-notes session rather than dropping the take.
+      if ("error" in published && published.status === 404) {
+        published = await publishPostFlow({
+          surfaces: [htmlSurface(audioHtml(url))],
+          title,
+          sessionTitle: "Voice notes",
+          agent: "viewer",
+          jobId,
+        });
+      }
+      if ("error" in published) throw new Error(`publish failed: ${published.error}`);
+      job.postId = published.post.id;
+
+      // 2 — transcribe with the same engine + model as pi-voicekit.
+      const stt = await import("./stt.ts");
+      if (!stt.sttAvailable()) {
+        job.state = "done";
+        step("Done — STT model not found (pi-voicekit local model missing)");
+        return;
+      }
+      step(stt.modelLoaded() ? "Transcribing voice…" : "Loading speech model…");
+      const transcript = await stt.transcribePcm(result.pcm);
+      if (!stt.modelLoaded()) step("Transcribing voice…");
+
+      if (!transcript) {
+        job.state = "done";
+        step("Done — no speech detected");
+        return;
+      }
+      job.transcript = transcript;
+
+      // 3 — upgrade the card to transcript text + player.
+      step("Updating note with transcript…");
+      const revised = await revisePost(published.post.id, {
+        surfaces: [
+          { kind: "markdown", markdown: transcript },
+          htmlSurface(audioHtml(url)),
+        ],
+      });
+      if ("error" in revised) throw new Error(`note update failed: ${revised.error}`);
+
+      // 4 — hand the transcript to Pi. The pi-sideshow-voice extension polls
+      // the inbox, claims the item by delivering it, and sends it through
+      // pi.sendUserMessage — exactly how pi-voicekit auto-submit works.
+      const itemId = `vitem-${jobId}`;
+      voiceInbox.push({
+        id: itemId,
+        seq: ++voiceInboxSeq,
+        jobId,
+        transcript,
+        mp3Url: url,
+        session,
+        createdAt: new Date().toISOString(),
+        status: "pending",
+      });
+      step("Waiting for Pi to pick up transcript…");
+      // The job settles if no Pi session is around to claim the transcript —
+      // the note keeps the text either way.
+      setTimeout(() => {
+        const item = voiceInbox.find((i) => i.id === itemId);
+        if (item?.status === "pending" && job.state === "running") {
+          job.state = "done";
+          job.step = "Done — note saved (no Pi session picked it up)";
+        }
+      }, 90_000).unref();
+    } catch (err: any) {
+      job.state = "error";
+      job.error = String(err?.message ?? err);
+      job.step = `Failed — ${job.error}`;
+    }
+  }
+
+  app.post("/api/voice/stop", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { session?: unknown };
+    const voice = await import("./voice.ts");
+    const result = await voice.stopVoiceRecording();
+    if ("error" in result) return c.json(result, result.status);
+    const { pcm, ...rec } = result;
+    const jobId = `vjob-${result.id}`;
+    voiceJobs.set(jobId, {
+      id: jobId,
+      state: "running",
+      step: "Saving audio…",
+      sentToPi: false,
+      file: rec.file,
+      url: result.url,
+    });
+    void runVoiceJob(
+      jobId,
+      { url: result.url, file: rec.file, pcm },
+      typeof body.session === "string" ? body.session : undefined,
+      c.req.raw,
+    );
+    return c.json({ ...rec, jobId }, 202);
+  });
+
+  app.get("/api/voice/jobs/:id", (c) => {
+    const job = voiceJobs.get(c.req.param("id"));
+    if (!job) return c.json({ error: "not found" }, 404);
+    return c.json(job);
+  });
+
+  // Inbox: the bridge the pi-sideshow-voice extension polls. Delivering is
+  // the claim — the first POST wins, later ones get 409, so exactly one Pi
+  // session receives a given transcript.
+  app.get("/api/voice/inbox", (c) =>
+    c.json(voiceInbox.filter((i) => i.status === "pending")),
+  );
+  app.post("/api/voice/inbox/:id/deliver", async (c) => {
+    const item = voiceInbox.find((i) => i.id === c.req.param("id"));
+    if (!item) return c.json({ error: "not found" }, 404);
+    if (item.status !== "pending") return c.json({ error: "already delivered" }, 409);
+    const body = (await c.req.json().catch(() => ({}))) as { client?: unknown };
+    item.status = "delivered";
+    item.deliveredBy = typeof body.client === "string" ? body.client.slice(0, 100) : undefined;
+    item.deliveredAt = new Date().toISOString();
+    const job = voiceJobs.get(item.jobId);
+    if (job) {
+      job.sentToPi = true;
+      // Keep the job running: the voice card's footer mirrors this step, so it
+      // shows "Pi is working…" until the reply comes back (see /result below).
+      job.step = "Pi is working…";
+      setTimeout(() => {
+        if (job.state === "running" && job.sentToPi) {
+          job.state = "done";
+          job.step = "Done — Pi finished";
+        }
+      }, PI_RESULT_TIMEOUT_MS).unref();
+    }
+    return c.json({ ok: true });
+  });
+
+  // Pi reports its reply for a claimed transcript. We publish a new card next
+  // to the voice note (the post's actual session, not the one that was
+  // requested) and settle the job so the card's footer flips to done.
+  app.post("/api/voice/jobs/:id/result", async (c) => {
+    const job = voiceJobs.get(c.req.param("id"));
+    if (!job) return c.json({ error: "not found" }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as { result?: unknown };
+    const result = typeof body.result === "string" ? body.result.trim() : "";
+    if (!result) return c.json({ error: "empty result" }, 400);
+    const card = job.postId ? await store.getPost(job.postId) : null;
+    if (!card) return c.json({ error: "voice card not found" }, 404);
+    const stamp = new Date().toLocaleString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      day: "numeric",
+      month: "short",
+    });
+    const published = await publishPostFlow({
+      surfaces: [{ kind: "markdown", markdown: result }],
+      title: `🤖 Pi — ${stamp}`,
+      session: card.sessionId,
+      agent: "pi",
+    });
+    if ("error" in published) return c.json({ error: published.error }, published.status);
+    job.state = "done";
+    job.step = "Done — Pi replied ✓";
+    return c.json({ ok: true, postId: published.post.id });
+  });
+
+  // Serve captured takes for the <audio> elements. Range support so the
+  // player can seek; anything but a .mp3 basename in the voice dir is a 404.
+  app.get("/voice/*", async (c) => {
+    const voice = await import("./voice.ts");
+    const fsp = await import("node:fs/promises");
+    // Hono does not expose the wildcard value as a named param — take it off
+    // the request path instead (basename only; the voice dir is flat).
+    const name = decodeURIComponent(
+      c.req.path.replace(/^\/voice\//, "").split("/").pop() ?? "",
+    );
+    const file = voice.resolveVoiceFile(name);
+    if (!file) return c.json({ error: "not found" }, 404);
+    let buf: Buffer;
+    let st: { size: number };
+    try {
+      [buf, st] = await Promise.all([fsp.readFile(file), fsp.stat(file)]);
+    } catch {
+      return c.json({ error: "not found" }, 404);
+    }
+    const total = st.size;
+    const baseHeaders = { "content-type": "audio/mpeg" };
+    const range = c.req.header("range");
+    if (range) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (m && (m[1] !== undefined || m[2] !== undefined)) {
+        let start = m[1] ? Number(m[1]) : 0;
+        let end = m[2] ? Math.min(Number(m[2]), total - 1) : total - 1;
+        if (m[1] === "" && m[2] !== "") {
+          // suffix range: last N bytes
+          start = Math.max(0, total - Number(m[2]));
+          end = total - 1;
+        }
+        if (start > end || start >= total) {
+          return new Response(null, {
+            status: 416,
+            headers: { "content-range": `bytes */${total}` },
+          });
+        }
+        return new Response(buf.subarray(start, end + 1), {
+          status: 206,
+          headers: {
+            ...baseHeaders,
+            "content-range": `bytes ${start}-${end}/${total}`,
+            "content-length": String(end - start + 1),
+          },
+        });
+      }
+    }
+    return new Response(buf, {
+      status: 200,
+      headers: { ...baseHeaders, "content-length": String(total) },
+    });
   });
 
   async function publish(c: any, body: any, surfaces: Surface[]) {

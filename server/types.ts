@@ -248,6 +248,12 @@ export interface Post {
   updatedAt: string;
   version: number;
   history: PostVersion[];
+  /**
+   * When this post is a live voice note, the id of the voice job that owns it
+   * (see server/app.ts runVoiceJob). The viewer uses it to render the job's
+   * progress in the card footer. Absent for ordinary posts.
+   */
+  jobId?: string;
 }
 
 export type CommentAnchor =
@@ -334,6 +340,8 @@ export interface CreatePostInput {
   sessionId: string;
   title?: string;
   surfaces: Surface[];
+  /** Attach a voice-job id so the viewer can render the job's progress. */
+  jobId?: string;
 }
 
 export interface UpdatePostInput {

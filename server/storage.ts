@@ -390,6 +390,7 @@ export class JsonFileStore implements Store {
       updatedAt: now,
       version: 1,
       history: [],
+      jobId: input.jobId,
     };
     this.surfaces.set(post.id, post);
     this.touch(input.sessionId);

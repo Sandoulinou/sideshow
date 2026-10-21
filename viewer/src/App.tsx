@@ -10,12 +10,14 @@ import {
   relTime,
   sessionLabel,
   type Post,
+  type Session,
   type SessionRow,
 } from "./api.ts";
 import { host, isShadow, navHostEl, root, SLOTS } from "./host.ts";
 import { applyFrameHeight, Card, cardForPost, frameForSource } from "./Card.tsx";
 import { ConnectInstructions } from "./Connect.tsx";
 import { HomeView, isHomePreviewFrame, resizeHomeFrame } from "./Home.tsx";
+import { PushToTalk } from "./PushToTalk.tsx";
 import { renderNotes } from "./notes.ts";
 import { SessionTimeline } from "./SessionTimeline.tsx";
 import { StreamSkeleton } from "./Skeleton.tsx";
@@ -24,6 +26,7 @@ import {
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
   PlugIcon,
+  PlusIcon,
   SunIcon,
   SystemIcon,
 } from "./icons.tsx";
@@ -285,6 +288,9 @@ export default function App() {
                     session list. Empty by default (self-hosted shows nothing here); an embedder
                     projects its own header — e.g. a cloud workspace picker + pinned Home link. */}
                 <slot name={SLOTS.asideHead} />
+                <Show when={!isReadonly()}>
+                  <NewSessionButton />
+                </Show>
                 <div id="sessionList">
                   <For each={sessionGroups()}>
                     {(group) => (
@@ -579,6 +585,41 @@ function isOwnFrame(source: unknown): boolean {
   return false;
 }
 
+// Creates a session straight from the web UI (POST /api/sessions, the same
+// store path an MCP publish auto-creation takes) and opens it. The session
+// is stamped agent "webui"; rename its title inline from the session head.
+function NewSessionButton() {
+  const [creating, setCreating] = createSignal(false);
+  return (
+    <button
+      class="new-session"
+      type="button"
+      disabled={creating()}
+      onClick={async () => {
+        if (creating()) return;
+        setCreating(true);
+        try {
+          const session = await api<Session>("/api/sessions", {
+            method: "POST",
+            body: JSON.stringify({ agent: "webui" }),
+          });
+          // Open the fresh session; the sidebar row lands via the SSE
+          // session-created broadcast (refreshSessions) plus a quiet refresh
+          // so the list doesn't wait for the event to arrive.
+          void select(session.id);
+          void refreshSessionsQuiet();
+        } catch (err) {
+          toast(err instanceof Error ? err.message : "Could not create session");
+        } finally {
+          setCreating(false);
+        }
+      }}
+    >
+      <PlusIcon /> New session
+    </button>
+  );
+}
+
 function SessionItem(props: { session: SessionRow }) {
   const label = () => sessionLabel(props.session);
   return (
@@ -684,6 +725,7 @@ function SessionView() {
         </span>
         <span class="head-sp"></span>
         <ViewToggle />
+        <PushToTalk />
         {/* Host-overridable region (SLOTS.sessionActions): session-scoped controls
             an embedder projects beside the toggle (e.g. cloud "Share"). Empty
             fallback — self-hosted renders nothing here. */}

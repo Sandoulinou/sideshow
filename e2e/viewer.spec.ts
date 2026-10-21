@@ -54,6 +54,22 @@ test("session rows show the agent's logo, with a fallback for unknown agents", a
   await expect(rows.nth(1).locator(".sess-meta svg.agent-mark")).toBeVisible();
 });
 
+test("the sidebar 'New session' button creates and opens a session", async ({ page, server }) => {
+  await page.goto(server.url);
+
+  const btn = page.getByRole("button", { name: "New session" });
+  await expect(btn).toBeVisible();
+  await btn.click();
+
+  // the fresh session appears in the sidebar, stamped with the web agent,
+  // and opens immediately in the stream
+  const rows = page.locator("#sessionList .sess");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText("webui session");
+  await expect(rows.first()).toHaveClass(/sel/);
+  await expect(page).toHaveURL(/\/session\/[a-z0-9]+/i);
+});
+
 test("snippet published over HTTP appears live via SSE, no reload", async ({ page, server }) => {
   await page.goto(server.url);
   await expect(page.locator("#onboard")).toBeVisible();

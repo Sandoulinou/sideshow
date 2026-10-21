@@ -30,6 +30,7 @@ import { ImageSurface } from "./ImageSurface.tsx";
 import { JsonSurface } from "./JsonSurface.tsx";
 import { activeTheme, resolvedMode } from "./theme.ts";
 import { TraceSurface } from "./TraceSurface.tsx";
+import { VoiceProgress } from "./VoiceProgress.tsx";
 import {
   comments,
   deleteComment,
@@ -225,6 +226,9 @@ export function Card(props: { post: Post | ViewerPost; standalone?: boolean }) {
       recentUpdateNow() - updatedAt < RECENT_UPDATE_MS
     );
   };
+
+  // Voice-note cards carry their job id so the footer can mirror live progress.
+  const voiceJobId = () => props.post.jobId;
 
   const closeFullscreen = () => {
     const opener = fullscreenOpener;
@@ -546,6 +550,9 @@ export function Card(props: { post: Post | ViewerPost; standalone?: boolean }) {
           readonly={isReadonly()}
           actions={(startReply) => (
             <>
+              <Show when={voiceJobId()}>
+                <VoiceProgress jobId={voiceJobId()!} />
+              </Show>
               <Show when={!isReadonly()}>
                 <button
                   class="act icon comment"

@@ -172,6 +172,16 @@ export function SunIcon() {
   );
 }
 
+// lucide: plus
+export function PlusIcon() {
+  return (
+    <Icon>
+      <path d="M5 12h14" />
+      <path d="M12 5v14" />
+    </Icon>
+  );
+}
+
 // lucide: moon
 export function MoonIcon() {
   return (

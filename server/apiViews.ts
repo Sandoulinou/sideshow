@@ -53,6 +53,7 @@ export const postWriteView = (post: Post) => ({
   updatedAt: post.updatedAt,
   version: post.version,
   surfaces: post.surfaces.map(surfaceRef),
+  ...(post.jobId && { jobId: post.jobId }),
 });
 
 export const postDetailView = (post: Post) => ({
@@ -87,6 +88,8 @@ export interface ViewerPost {
   updatedAt: string;
   version: number;
   versionCount: number;
+  /** Voice-job id for live voice-note cards; the viewer renders progress from it. */
+  jobId?: string;
 }
 
 export const viewerPostView = (post: Post): ViewerPost => ({
@@ -98,6 +101,7 @@ export const viewerPostView = (post: Post): ViewerPost => ({
   updatedAt: post.updatedAt,
   version: post.version,
   versionCount: post.history.length + 1,
+  ...(post.jobId && { jobId: post.jobId }),
 });
 
 // One session's whole stream, hydrated in a single response (`?hydrate=1`). It
