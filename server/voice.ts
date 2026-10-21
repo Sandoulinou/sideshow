@@ -19,7 +19,9 @@ const CHANNELS = 1;
 // a device the user isn't speaking into — e.g. a Bluetooth headset left on
 // another desk — in which case every take is silence and STT finds nothing.
 // SIDESHOW_VOICE_INPUT forces ffmpeg avfoundation capture of a specific
-// device: an audio-device index ("1" → ":1") or a device name.
+// device, by a name substring ("Micro MacBook Air") or an audio-device
+// index ("1"). Name pins are resolved to a live index at capture time —
+// avfoundation's ":<n>" order is not stable across device hotplug.
 const VOICE_INPUT = process.env.SIDESHOW_VOICE_INPUT?.trim() ?? "";
 // Hard ceiling on one take — the child is killed; the next /stop finalizes it.
 const MAX_RECORDING_MS = 10 * 60 * 1000;
@@ -35,6 +37,11 @@ interface CaptureTool {
   name: ToolName;
   cmd: string;
   args: string[];
+  /**
+   * Raw avfoundation selector appearing verbatim in args (name or index).
+   * Resolved to a ":<n>" index at capture time via resolveAvFoundationSelector.
+   */
+  selector?: string;
 }
 
 function commandExists(cmd: string): boolean {
@@ -76,9 +83,9 @@ function probeFfmpeg(selector?: string): CaptureTool | null {
   const isMac = process.platform === "darwin";
   const isWin = process.platform === "win32";
   // avfoundation takes ":<index>" for an audio device index (a bare index
-  // selects a camera) and a plain name otherwise.
-  const macSelector = (sel?: string) =>
-    sel ? (/^\d+$/.test(sel) ? `:${sel}` : sel) : ":default";
+  // selects a camera). A pinned selector is kept raw in args and resolved to
+  // ":<n>" at capture time (name substring → live device-list scan).
+  const macSelector = (sel?: string) => sel ?? ":default";
   const inputArgs = isMac
     ? ["-f", "avfoundation", "-i", macSelector(selector)]
     : isWin
@@ -101,7 +108,34 @@ function probeFfmpeg(selector?: string): CaptureTool | null {
       "error",
       "pipe:1",
     ],
+    selector: isMac ? selector : undefined,
   };
+}
+
+// Resolve a pinned avfoundation selector to the ":<n>" form ffmpeg accepts.
+// Bare indexes map straight through ("1" → ":1"); names are matched against
+// the live device list (this ffmpeg build's name selection is broken — every
+// -i "name" fails with an I/O error — so we must hand it an index). The index
+// order shifts when devices connect/disconnect, hence the per-capture scan.
+function resolveAvFoundationSelector(selector: string): string {
+  if (/^\d+$/.test(selector)) return `:${selector}`;
+  if (selector.startsWith(":")) return selector;
+  const res = spawnSync("ffmpeg", ["-f", "avfoundation", "-list_devices", "true", "-i", ""], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const re = /^\[AVFoundation indev [^\]]*\] \[(\d+)\] (.+)$/gm;
+  const devices: Array<{ index: number; name: string }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(res.stderr ?? ""))) {
+    devices.push({ index: Number(m[1]), name: m[2].trim() });
+  }
+  const hit = devices.find((d) => d.name.toLowerCase().includes(selector.toLowerCase()));
+  if (!hit) {
+    const available = devices.map((d) => `[${d.index}] ${d.name}`).join(", ");
+    throw new Error(`no audio device matching "${selector}" — available: ${available || "none"}`);
+  }
+  return `:${hit.index}`;
 }
 
 function probeArecord(): CaptureTool | null {
@@ -173,7 +207,15 @@ export async function startVoiceRecording(): Promise<
   const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const tmpPath = tmpPcmPath(id);
   const stream = createWriteStream(tmpPath);
-  const proc = spawn(tool.cmd, tool.args, { stdio: ["ignore", "pipe", "pipe"] });
+  let args = tool.args;
+  if (tool.selector !== undefined) {
+    try {
+      args = tool.args.map((a) => (a === tool.selector ? resolveAvFoundationSelector(tool.selector!) : a));
+    } catch (err) {
+      return { error: (err as Error).message, status: 500 };
+    }
+  }
+  const proc = spawn(tool.cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
   proc.stdout?.pipe(stream);
   // Capture stderr to keep the parent's logs clean but surface real failures.
   let stderr = "";
