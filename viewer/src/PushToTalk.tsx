@@ -38,6 +38,22 @@ interface JobView {
   sentToPi?: boolean;
 }
 
+// TEMP DEBUG: gesture timing for capture-duration forensics (dev console).
+const dbg = { pressAt: 0, startAt: 0, stopSentAt: 0 };
+const dbgLog = (what: string, extra?: Record<string, unknown>) =>
+  console.info(
+    "[ptt]", what,
+    {
+      pressAt: dbg.pressAt,
+      startedAt: dbg.startAt,
+      stopSentAt: dbg.stopSentAt,
+      heldMs: dbg.pressAt ? Date.now() - dbg.pressAt : undefined,
+      recMs: dbg.startAt ? Date.now() - dbg.startAt : undefined,
+      ...extra,
+    },
+    new Date().toISOString(),
+  );
+
 export function PushToTalk() {
   const [phase, setPhase] = createSignal<Phase>("idle");
   const [stepLabel, setStepLabel] = createSignal("");
@@ -87,9 +103,12 @@ export function PushToTalk() {
   const startCapture = async () => {
     armingTimer = null;
     setPhase("starting");
+    dbgLog("start.request");
     try {
       await api("/api/voice/start", { method: "POST", body: "{}" });
       holding = true;
+      dbg.startAt = Date.now();
+      dbgLog("start.ok (server capture armed)");
       setPhase("recording");
     } catch (e: any) {
       setPhase("idle");
@@ -102,24 +121,34 @@ export function PushToTalk() {
   const arm = () => {
     if (holding || working || armingTimer) return;
     setError("");
+    dbg.pressAt = Date.now();
+    dbg.startAt = 0;
+    dbg.stopSentAt = 0;
+    dbgLog("press (arming, hold " + HOLD_MS + "ms)");
     setPhase("arming");
     armingTimer = setTimeout(() => void startCapture(), HOLD_MS);
   };
 
   /** Any release ends the current gesture: cancel an armed hold, or stop. */
-  const release = () => {
+  const release = (reason = "release") => {
     if (armingTimer) {
       clearTimeout(armingTimer);
       armingTimer = null;
+      dbgLog(`release before armed (${reason}) — nothing recorded`);
       setPhase("idle");
       return;
     }
-    if (holding) void stop();
+    if (holding) {
+      dbgLog(`release (${reason})`);
+      void stop(reason);
+    }
   };
 
-  const stop = async () => {
+  const stop = async (reason = "stop") => {
     if (!holding) return;
     holding = false;
+    dbg.stopSentAt = Date.now();
+    dbgLog(`stop.request (${reason})`);
     try {
       const res = await api<{ jobId: string }>(
         "/api/voice/stop",
@@ -129,6 +158,7 @@ export function PushToTalk() {
           body: JSON.stringify({ session: selected() ?? null }),
         },
       );
+      dbgLog("stop.ok — server says:", { res });
       working = true;
       setPhase("working");
       setStepLabel("Saving audio…");
@@ -192,9 +222,9 @@ export function PushToTalk() {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (inEditable(e.target)) return;
       e.preventDefault();
-      release();
+      release("keyup");
     };
-    const onBlur = () => release();
+    const onBlur = () => release("window blur");
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", onBlur);
@@ -231,8 +261,8 @@ export function PushToTalk() {
         }
         arm();
       }}
-      onPointerUp={release}
-      onPointerCancel={release}
+      onPointerUp={() => release("pointerup")}
+      onPointerCancel={() => release("pointercancel")}
       onContextMenu={(e) => e.preventDefault()}
     >
       {phase() === "working" ? (

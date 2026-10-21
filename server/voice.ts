@@ -1,14 +1,18 @@
 // Push-to-talk capture for the viewer.
 //
 // Input mirrors pi-voicekit exactly: same tool priority (sox `rec` → ffmpeg →
-// arecord, ffmpeg first when PULSE_SERVER is set), same default-input device,
-// 16 kHz mono 16-bit PCM on stdout. The captured PCM is converted to an mp3
+// arecord, ffmpeg first when PULSE_SERVER is set), same default-input device.
+// Capture tools write RAW device-rate mono 16-bit PCM on stdout — the device's
+// true rate is not trusted (macOS/CoreAudio has been observed delivering
+// 44.1/48 kHz while claiming 16 kHz, and worse), so the take's delivery rate
+// is measured from its own sample count vs wall time and resampled to 16 kHz
+// explicitly. The captured PCM is converted to an mp3
 // under ~/.sideshow/voice/ and served at /voice/<file>.mp3 so a post's html
 // surface can embed <audio src="/voice/<file>.mp3">.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createWriteStream, type WriteStream } from "node:fs";
-import { mkdir, readFile, stat, unlink } from "node:fs/promises";
+import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -72,8 +76,8 @@ function probeSox(): CaptureTool | null {
       "-t",
       "raw",
       "-",
-      "rate",
-      String(SAMPLE_RATE),
+      // No `rate` effect: the device rate is measured after the take and
+      // resampled explicitly (the nominal-rate assumption is what broke).
     ],
   };
 }
@@ -98,8 +102,8 @@ function probeFfmpeg(selector?: string): CaptureTool | null {
       ...inputArgs,
       "-ac",
       String(CHANNELS),
-      "-ar",
-      String(SAMPLE_RATE),
+      // No -ar: capture at whatever rate the device is actually delivering;
+      // the take is measured and resampled to 16 kHz in stopVoiceRecording.
       "-sample_fmt",
       "s16",
       "-f",
@@ -191,6 +195,9 @@ interface Active {
 }
 
 let active: Active | null = null;
+// Last measured device delivery rate — sticky fallback for takes too short
+// to measure reliably (< 1.5 s wall time).
+let lastDeviceRate: number | null = null;
 
 function tmpPcmPath(id: string): string {
   return join("/tmp", `sideshow-voice-${id}.pcm`);
@@ -327,7 +334,7 @@ export async function stopVoiceRecording(): Promise<
     pcm = null;
   }
   const pcmBytes = pcm?.length ?? 0;
-  if (pcmBytes < 320) {
+  if (!pcm || pcmBytes < 320) {
     // 16-bit mono @16 kHz → 32 B/s; below this there is effectively no audio.
     try {
       await unlink(cur.tmpPath);
@@ -337,10 +344,36 @@ export async function stopVoiceRecording(): Promise<
     return { error: "no audio captured — is a microphone connected and allowed?", status: 400 };
   }
 
+  // Measure the device's true delivery rate from the take itself. avfoundation
+  // and sox both trust the nominal rate, but this stack has been observed
+  // delivering 44.1/48 kHz while claiming 16 kHz (audio plays "max speed")
+  // and ~5 kHz under load (fast-forward blur). samples / wall time, snapped to
+  // the nearest standard rate, is the only honest number.
+  const STANDARD_RATES = [8000, 16000, 32000, 44100, 48000];
+  const samples = Math.floor(pcm.length / (2 * CHANNELS));
+  // startedAt is set right before spawn; subtract device-open warm-up.
+  const wallSec = Math.max((Date.now() - cur.startedAt) / 1000 - 0.3, 0.5);
+  let deviceRate = lastDeviceRate ?? SAMPLE_RATE;
+  if (wallSec >= 1.5) {
+    const measured = samples / wallSec;
+    deviceRate = STANDARD_RATES.reduce((a, b) =>
+      Math.abs(b - measured) < Math.abs(a - measured) ? b : a,
+    );
+    lastDeviceRate = deviceRate;
+    console.log(`[sideshow voice] measured device rate ${Math.round(measured)} Hz → ${deviceRate} Hz (${cur.id})`);
+  }
+  let finalPcm = pcm;
+  if (deviceRate !== SAMPLE_RATE) {
+    const resampled = await resampleTo16k(pcm, deviceRate, cur.id);
+    if (resampled.length >= 320) finalPcm = resampled;
+  }
+
   const dir = voiceDir();
   await mkdir(dir, { recursive: true });
   const outFile = join(dir, `${cur.id}.mp3`);
-  // Convert the raw PCM take to an mp3 the browser can play.
+  const convIn = join("/tmp", `sideshow-voice-${cur.id}-16k-in.pcm`);
+  await writeFile(convIn, finalPcm);
+  // Convert the 16 kHz PCM take to an mp3 the browser can play.
   const conv = spawn(
     "ffmpeg",
     [
@@ -354,7 +387,7 @@ export async function stopVoiceRecording(): Promise<
       "-ac",
       String(CHANNELS),
       "-i",
-      cur.tmpPath,
+      convIn,
       "-codec:a",
       "libmp3lame",
       "-b:a",
@@ -372,11 +405,8 @@ export async function stopVoiceRecording(): Promise<
       resolve(code === 0);
     });
   });
-  try {
-    await unlink(cur.tmpPath);
-  } catch {
-    /* ignore */
-  }
+  await unlink(cur.tmpPath).catch(() => {});
+  await unlink(convIn).catch(() => {});
   if (!convOk) {
     try {
       await unlink(outFile);
@@ -391,10 +421,38 @@ export async function stopVoiceRecording(): Promise<
     file: `${cur.id}.mp3`,
     url: `/voice/${cur.id}.mp3`,
     tool: cur.tool.name,
-    ms: Math.round(pcmBytes / (2 * CHANNELS) / SAMPLE_RATE * 1000),
+    ms: Math.round(finalPcm.length / (2 * CHANNELS) / SAMPLE_RATE * 1000),
     bytes: mp3Bytes,
-    pcm: pcm ?? Buffer.alloc(0),
+    pcm: finalPcm,
   };
+}
+
+/** Resample raw mono s16le PCM from fromRate to 16 kHz via ffmpeg. */
+async function resampleTo16k(pcm: Buffer, fromRate: number, id: string): Promise<Buffer> {
+  const inPath = join("/tmp", `sideshow-voice-${id}-rs-in.pcm`);
+  const outPath = join("/tmp", `sideshow-voice-${id}-rs-out.pcm`);
+  try {
+    await writeFile(inPath, pcm);
+    const r = spawnSync(
+      "ffmpeg",
+      [
+        "-y", "-loglevel", "error",
+        "-f", "s16le", "-ar", String(fromRate), "-ac", String(CHANNELS),
+        "-i", inPath,
+        "-ar", String(SAMPLE_RATE), "-ac", String(CHANNELS), "-f", "s16le",
+        outPath,
+      ],
+    );
+    if (r.status === 0) {
+      return await readFile(outPath).catch(() => Buffer.alloc(0));
+    }
+  } catch {
+    /* fall through */
+  } finally {
+    await unlink(inPath).catch(() => {});
+    await unlink(outPath).catch(() => {});
+  }
+  return Buffer.alloc(0);
 }
 
 export function resolveVoiceFile(name: string): string | null {
