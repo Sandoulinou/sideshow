@@ -15,6 +15,12 @@ import { join } from "node:path";
 
 const SAMPLE_RATE = 16000;
 const CHANNELS = 1;
+// Optional capture-device pin (macOS). The system DEFAULT input can point at
+// a device the user isn't speaking into — e.g. a Bluetooth headset left on
+// another desk — in which case every take is silence and STT finds nothing.
+// SIDESHOW_VOICE_INPUT forces ffmpeg avfoundation capture of a specific
+// device: an audio-device index ("1" → ":1") or a device name.
+const VOICE_INPUT = process.env.SIDESHOW_VOICE_INPUT?.trim() ?? "";
 // Hard ceiling on one take — the child is killed; the next /stop finalizes it.
 const MAX_RECORDING_MS = 10 * 60 * 1000;
 
@@ -65,12 +71,16 @@ function probeSox(): CaptureTool | null {
   };
 }
 
-function probeFfmpeg(): CaptureTool | null {
+function probeFfmpeg(selector?: string): CaptureTool | null {
   if (!commandExists("ffmpeg")) return null;
   const isMac = process.platform === "darwin";
   const isWin = process.platform === "win32";
+  // avfoundation takes ":<index>" for an audio device index (a bare index
+  // selects a camera) and a plain name otherwise.
+  const macSelector = (sel?: string) =>
+    sel ? (/^\d+$/.test(sel) ? `:${sel}` : sel) : ":default";
   const inputArgs = isMac
-    ? ["-f", "avfoundation", "-i", ":default"]
+    ? ["-f", "avfoundation", "-i", macSelector(selector)]
     : isWin
       ? ["-f", "dshow", "-i", "audio=Microphone"]
       : ["-f", "pulse", "-i", "default"];
@@ -106,6 +116,16 @@ function probeArecord(): CaptureTool | null {
 let cachedTool: CaptureTool | null | undefined;
 function detectCaptureTool(): CaptureTool | null {
   if (cachedTool !== undefined) return cachedTool;
+  // A pinned device goes straight to ffmpeg (sox on macOS only ever uses the
+  // system default input, so it can't honor SIDESHOW_VOICE_INPUT).
+  if (VOICE_INPUT) {
+    const pinned = probeFfmpeg(VOICE_INPUT);
+    if (pinned) {
+      cachedTool = pinned;
+      return pinned;
+    }
+    // Fall through: ffmpeg unavailable → default-device probes below.
+  }
   const order: (() => CaptureTool | null)[] = [probeSox, probeFfmpeg, probeArecord];
   // pi-voicekit prefers ffmpeg when PULSE_SERVER is set (remote pulse tunnels).
   if (process.env.PULSE_SERVER) order.reverse();

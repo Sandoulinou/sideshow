@@ -1365,7 +1365,13 @@ export function createApp({
 
       if (!transcript) {
         job.state = "done";
-        step("Done — no speech detected");
+        // Usually a wrong/quiet input device (macOS default input can be a
+        // headset the user isn't wearing) — say so, with the fix.
+        step(
+          process.env.SIDESHOW_VOICE_INPUT
+            ? "Done — no speech detected (check the pinned mic device / input level)"
+            : "Done — no speech detected (check the default input device / input level — SIDESHOW_VOICE_INPUT can pin one)",
+        );
         return;
       }
       job.transcript = transcript;
